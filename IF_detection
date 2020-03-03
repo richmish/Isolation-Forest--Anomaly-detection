@@ -1,0 +1,187 @@
+import pyodbc 
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+#method to get data from sql server
+def get_data():
+    conn = pyodbc.connect('Driver={XXX};'
+                      'Server=DE-XXXX;'
+                      'Database=XXXX;'
+                      'Trusted_Connection=yes;')
+
+    query = "SELECT * FROM OrderDataView where OrderConfirmDate < convert(date,'2020-01-01') and OrderConfirmDate > convert(date,'2015-12-31')";
+    return pd.read_sql(query, conn)
+
+#method to initialize some column names like order confirmation date, predictiion level, output column. 
+#If there is any change in the name of the columns in View , this method needs to be updated
+def intialize_columns():
+    return "OrderConfirmDate", "it_ProductFamily","OrderQuantity"
+
+#May be just top three for thesis. this method is only for the thesis puprose to focus on only top 3 product families
+def get_top_families(sumdf):        
+    SortedProductFamilies = sumdf.sum().sort_values(ascending = False).index
+    return SortedProductFamilies[0:5]
+
+def get_daily_sale_for_each_product_family(orderdf,prediction_level):
+    everydaydf = orderdf.groupby([orderdf.OrderConfirmDate,prediction_level])[output_column].sum().unstack()
+    #everydaydf.columns = everydaydf.columns.droplevel(level=0)
+    to_model_columns = get_top_families(everydaydf)
+    everydaydf = everydaydf[to_model_columns]
+    everydaydf.fillna(0,inplace=True)
+    return everydaydf,to_model_columns
+
+
+def iqr_bounds(scores,k=1.5):
+    q1 = scores.quantile(0.25)
+    q3 = scores.quantile(0.75)
+    iqr = q3 - q1
+    lower_bound=(q1 - k * iqr)
+    upper_bound=(q3 + k * iqr)
+    print("Lower bound:{} \nUpper bound:{}".format(lower_bound,upper_bound))
+    return lower_bound,upper_bound
+
+def plot_anomaly(df,metric_name,outliers):
+    df.load_date = pd.to_datetime(df['OrderConfirmDate'].astype(str), format="%Y-%m-%d")
+    dates = df.load_date
+    #dates = json.dumps(dates)
+    #identify the anomaly points and create a array of its values for plot
+    bool_array = (abs(df['anomaly']) > 0)
+    actuals = df["actuals"][-len(bool_array):]
+    anomaly_points = bool_array * actuals
+    anomaly_points[anomaly_points == 0] = np.nan
+    #A dictionary for conditional format table based on anomaly
+    color_map = {0: '#808080', 1: "yellow", 2: "red"}
+    
+    #Table which includes Date,Actuals,Change occured from previous point
+    table = go.Table(
+        domain=dict(x=[0, 1],
+                    y=[0, 0.3]),
+        columnwidth=[1, 2],
+        # columnorder=[0, 1, 2,],
+        header=dict(height=20,
+                    values=[['<b>Date</b>'], ['<b>Actual Values </b>'], 
+                            ],
+                    font=dict(color=['rgb(45, 45, 45)'] * 5, size=14),
+                    fill=dict(color='#d562be')),
+        cells=dict(values=[outliers.round(3)[k].tolist() for k in ['OrderConfirmDate', 'actuals']],
+                   line=dict(color='#506784'),
+                   align=['center'] * 5,
+                   font=dict(color=['rgb(40, 40, 40)'] * 5, size=12),
+                   # format = [None] + [",.4f"] + [',.4f'],
+                   # suffix=[None] * 4,
+                   suffix=[None] + [''] + [''] + ['%'] + [''],
+                   height=27
+                   #fill=dict(color=[test_df['anomaly_class'].map(color_map)],#map based on anomaly level from dictionary
+                   #)
+                   ))
+    #Plot the actuals points
+    Actuals = go.Scatter(name='Actuals',
+                         x=dates,
+                         y=df['actuals'],
+                         xaxis='x1', yaxis='y1',
+                         mode='lines',
+                         marker=dict(size=12,
+                                     line=dict(width=1),
+                                     color="blue"))
+#Highlight the anomaly points
+    anomalies_map = go.Scatter(name='Anomaly',
+                               showlegend=True,
+                               x=dates,
+                               y=anomaly_points,
+                               mode='markers',
+                               xaxis='x1',
+                               yaxis='y1',
+                               marker=dict(color="firebrick",
+                                           size=11,
+                                           line=dict(
+                                               color="firebrick",
+                                               width=2)))
+    axis = dict(
+        showline=True,
+        zeroline=False,
+        showgrid=True,
+        mirror=True,
+        ticklen=4,
+        gridcolor='#ffffff',
+        tickfont=dict(size=10))
+    layout = dict(
+        width=1000,
+        height=865,
+        autosize=False,
+        title=metric_name,
+        margin=dict(t=75),
+        showlegend=True,
+        xaxis1=dict(axis, **dict(domain=[0, 1], anchor='y1', showticklabels=True)),
+        yaxis1=dict(axis, **dict(domain=[2 * 0.21 + 0.20, 1], anchor='x1', hoverformat='.2f')))
+    #table = table.to_json()
+    #anomalies_map = anomalies_map.to_json()
+    #Actuals =Actuals.to_json()
+    fig = go.Figure(data=[table, anomalies_map, Actuals], layout=layout)
+    iplot(fig)
+    #pyplot.show()
+    
+def classify_anomalies(df,metric_name):
+    df['metric_name']=metric_name
+    df = df.sort_values(by='OrderConfirmDate', ascending=False)
+    #Shift actuals by one timestamp to find the percentage chage between current and previous data point
+    df['shift'] = df['actuals'].shift(-1)
+    df['percentage_change'] = ((df['actuals'] - df['shift']) / df['actuals']) * 100
+    #Categorise anomalies as 0-no anomaly, 1- low anomaly , 2 - high anomaly
+    df['anomaly'].loc[df['anomaly'] == 1] = 0
+    df['anomaly'].loc[df['anomaly'] == -1] = 2
+    df['anomaly_class'] = df['anomaly']
+   
+    max_anomaly_score = df['score'].loc[df['anomaly_class'] == 2].max()
+    medium_percentile = df['score'].quantile(0.24)
+    print("Upper bound:",upper_bound)
+    print("Lower bpund:",lower_bound)
+    print(max_anomaly_score,medium_percentile)
+    
+    df['anomaly_class'].loc[(df['score'] > max_anomaly_score) & (df['score'] <= medium_percentile)] = 1
+    print(len(df.loc[df['anomaly_class'] == 1]))
+    print(len(df.loc[df['anomaly_class'] == 2]))
+    return df
+
+#this code is for creating model for Isolation Forest
+clf=IsolationForest(n_estimators=100, max_samples='auto', contamination=float(.010), \
+                        max_features=1.0, bootstrap=False, n_jobs=-1, random_state=42, verbose=0)
+clf.fit(everydaydf[to_model_columns])
+everydaydf['scores']=clf.decision_function(everydaydf[to_model_columns])
+pred = clf.predict(everydaydf[to_model_columns])
+everydaydf['anomaly']=pred
+outliers=everydaydf.loc[everydaydf['anomaly']==-1]
+outlier_index=list(outliers.index)
+#print(outlier_index)
+#Find the number of anomalies and normal points here points classified -1 are anomalous
+print(everydaydf['anomaly'].value_counts())
+lower_bound,upper_bound=iqr_bounds(everydaydf['scores'],k=2)
+
+orderdf = get_data()
+date_column,prediction_level,output_column = intialize_columns()
+everydaydf,to_model_columns = get_daily_sale_for_each_product_family(orderdf,prediction_level)
+
+import warnings  
+warnings.filterwarnings('ignore')
+for i in range(1,len(everydaydf.columns)-1):
+    clf.fit(everydaydf.iloc[:,i:i+1])
+    pred = clf.predict(everydaydf.iloc[:,i:i+1])
+    test_df=pd.DataFrame()
+    test_df['OrderConfirmDate']=everydaydf['OrderConfirmDate']
+    #Find decision function to find the score and classify anomalies
+    test_df['score']=clf.decision_function(everydaydf.iloc[:,i:i+1])
+    test_df['actuals']=everydaydf.iloc[:,i:i+1]
+    test_df['anomaly']=pred
+ 
+    #Get the indexes of outliers in order to compare the metrics     with use case anomalies if required
+    outliers=test_df.loc[test_df['anomaly']==-1]
+    outlier_index=list(outliers.index)
+    print("Outlier Index",outlier_index)
+    outlierdf = pd.concat((outlierdf,pd.Series(outliers.index)), axis=1)
+    print("Outlier",outliers)
+    #outlierdf = pd.concat((outlierdf,pd.Series(outliers.index)), axis=1)
+    test_df=classify_anomalies(test_df,everydaydf.columns[i])
+    #print(test_df)
+    plot_anomaly(test_df,everydaydf.columns[i],outliers)
